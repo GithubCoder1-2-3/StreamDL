@@ -1,257 +1,189 @@
-const express = require('express');
-const { spawn, exec } = require('child_process');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { URL } = require('url');
+#!/usr/bin/env node
 
-const app = express();
-const PORT = 5000;
+const inquirer = require("inquirer");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const ffmpegPath = require("ffmpeg-static");
+const ffmpeg = require("fluent-ffmpeg");
+const chalk = require("chalk");
+const pLimit = require("p-limit");
 
-app.use(express.json());
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+ffmpeg.setFfmpegPath(ffmpegPath);
 
-const REPLIT_BASE = 'http://localhost:3002';
+const CONCURRENT_DOWNLOADS = 10;
 
-// Proxy: fetch from Core API
-app.get('/api/sources', async (req, res) => {
-  const { type, id, season, episode } = req.query;
-  let url;
-  if (type === 'movie') {
-    url = `${REPLIT_BASE}/v1/movie/${id}`;
-  } else {
-    url = `${REPLIT_BASE}/v1/tv/${id}/${season}/${episode}`;
-  }
-  
-  try {
-    const data = await fetchJson(url);
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+async function askUrl() {
+    const { url } = await inquirer.prompt([
+        {
+            type: "input",
+            name: "url",
+            message: "📡 Enter M3U8 URL:",
+            validate: v => v.startsWith("http") || "Invalid URL"
+        }
+    ]);
 
-// Test a source URL to see if it's reachable
-app.post('/api/test-source', async (req, res) => {
-  const { url, headers } = req.body;
-  const start = Date.now();
-  try {
-    await fetchHead(url, headers, 5000);
-    res.json({ ok: true, latency: Date.now() - start });
-  } catch (e) {
-    res.json({ ok: false, error: e.message, latency: Date.now() - start });
-  }
-});
-
-// Convert m3u8/mp4 stream to downloadable mp4
-app.post('/api/convert', async (req, res) => {
-  const { url, headers, filename } = req.body;
-  const safeFilename = (filename || 'download').replace(/[^a-zA-Z0-9._-]/g, '_') + '.mp4';
-  const tmpPath = path.join(os.tmpdir(), `streamdl_${Date.now()}_${safeFilename}`);
-
-  // Build ffmpeg args
-  const inputArgs = [];
-  
-  // Add headers if present
-  if (headers) {
-    const headerStr = Object.entries(headers)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join('\r\n');
-    inputArgs.push('-headers', headerStr);
-  }
-  
-  inputArgs.push('-i', url);
-
-  const args = [
-    ...inputArgs,
-    '-c', 'copy',
-    '-bsf:a', 'aac_adtstoasc',
-    '-movflags', '+faststart',
-    '-y',
-    tmpPath
-  ];
-
-  console.log('Running ffmpeg:', args.join(' '));
-
-  const ffmpeg = spawn('ffmpeg', args);
-  let stderr = '';
-
-  ffmpeg.stderr.on('data', (d) => {
-    stderr += d.toString();
-    // Stream progress to client via SSE would be ideal but we use simple approach
-  });
-
-  ffmpeg.on('close', (code) => {
-    if (code !== 0) {
-      console.error('FFmpeg failed:', stderr.slice(-500));
-      // Try cleanup
-      try { fs.unlinkSync(tmpPath); } catch {}
-      return res.status(500).json({ error: 'FFmpeg conversion failed', details: stderr.slice(-500) });
-    }
-    
-    const stat = fs.statSync(tmpPath);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    res.setHeader('Content-Length', stat.size);
-    
-    const stream = fs.createReadStream(tmpPath);
-    stream.pipe(res);
-    stream.on('end', () => {
-      try { fs.unlinkSync(tmpPath); } catch {}
-    });
-    stream.on('error', (err) => {
-      try { fs.unlinkSync(tmpPath); } catch {}
-    });
-  });
-
-  ffmpeg.on('error', (err) => {
-    res.status(500).json({ error: 'FFmpeg not found: ' + err.message });
-  });
-});
-
-// SSE endpoint for conversion progress
-app.post('/api/convert-progress', async (req, res) => {
-  const { url, headers, filename, duration } = req.body;
-  const safeFilename = (filename || 'download').replace(/[^a-zA-Z0-9._-]/g, '_') + '.mp4';
-  const tmpPath = path.join(os.tmpdir(), `streamdl_${Date.now()}_${safeFilename}`);
-  const progressId = `${Date.now()}`;
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-  const inputArgs = [];
-  if (headers) {
-    const headerStr = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\r\n');
-    inputArgs.push('-headers', headerStr);
-  }
-  inputArgs.push('-i', url);
-
-  const args = [
-    ...inputArgs,
-    '-c', 'copy',
-    '-bsf:a', 'aac_adtstoasc',
-    '-movflags', '+faststart',
-    '-progress', 'pipe:1',
-    '-y',
-    tmpPath
-  ];
-
-  const ffmpeg = spawn('ffmpeg', args);
-  let stderr = '';
-  let outId = progressId;
-  
-  // Store file path for download
-  progressFiles[outId] = { path: tmpPath, filename: safeFilename, ready: false };
-
-  ffmpeg.stdout.on('data', (d) => {
-    const text = d.toString();
-    // Parse progress
-    const lines = text.split('\n');
-    const prog = {};
-    for (const line of lines) {
-      const [k, v] = line.split('=');
-      if (k && v) prog[k.trim()] = v.trim();
-    }
-    if (prog.out_time_us) {
-      const seconds = parseInt(prog.out_time_us) / 1e6;
-      const pct = duration ? Math.min(99, (seconds / duration) * 100) : -1;
-      send({ type: 'progress', seconds: seconds.toFixed(1), pct: pct.toFixed(1) });
-    }
-  });
-
-  ffmpeg.stderr.on('data', (d) => { stderr += d.toString(); });
-
-  ffmpeg.on('close', (code) => {
-    if (code !== 0) {
-      send({ type: 'error', message: 'Conversion failed', details: stderr.slice(-300) });
-      try { fs.unlinkSync(tmpPath); } catch {}
-      delete progressFiles[outId];
-      res.end();
-      return;
-    }
-    progressFiles[outId].ready = true;
-    send({ type: 'done', downloadId: outId });
-    res.end();
-  });
-
-  req.on('close', () => {
-    ffmpeg.kill();
-  });
-});
-
-const progressFiles = {};
-
-app.get('/api/download/:id', (req, res) => {
-  const { id } = req.params;
-  const file = progressFiles[id];
-  if (!file || !file.ready) return res.status(404).json({ error: 'Not ready or not found' });
-  
-  const stat = fs.statSync(file.path);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
-  res.setHeader('Content-Length', stat.size);
-  
-  const stream = fs.createReadStream(file.path);
-  stream.pipe(res);
-  stream.on('end', () => {
-    setTimeout(() => {
-      try { fs.unlinkSync(file.path); } catch {}
-      delete progressFiles[id];
-    }, 30000);
-  });
-});
-
-function fetchJson(url) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { timeout: 15000 }, (r) => {
-      let data = '';
-      r.on('data', c => data += c);
-      r.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Invalid JSON: ' + data.slice(0, 200))); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-  });
+    return url;
 }
 
-function fetchHead(url, headers, timeout) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method: 'HEAD',
-      headers: headers || {},
-      timeout,
-    };
-    const mod = parsed.protocol === 'https:' ? https : http;
-    const req = mod.request(options, (r) => {
-      if (r.statusCode >= 200 && r.statusCode < 400) resolve(r.statusCode);
-      else reject(new Error(`HTTP ${r.statusCode}`));
-      r.resume();
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    req.end();
-  });
+/* -------------------- GET BEST QUALITY -------------------- */
+
+async function getBestStream(url) {
+    console.log(chalk.cyan("\n🔍 Fetching playlist..."));
+
+    const res = await axios.get(url);
+    const data = res.data;
+
+    // If master playlist → choose highest resolution
+    if (data.includes("#EXT-X-STREAM-INF")) {
+        const lines = data.split("\n");
+
+        let best = { bandwidth: 0, uri: null };
+
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes("#EXT-X-STREAM-INF")) {
+                const bandwidthMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+                const bandwidth = bandwidthMatch ? parseInt(bandwidthMatch[1]) : 0;
+
+                const uri = lines[i + 1]?.trim();
+
+                if (bandwidth > best.bandwidth) {
+                    best = { bandwidth, uri };
+                }
+            }
+        }
+
+        if (best.uri) {
+            const bestUrl = new URL(best.uri, url).toString();
+            console.log(chalk.green("✅ Best quality selected"));
+            return bestUrl;
+        }
+    }
+
+    return url;
 }
 
-app.use(express.static(path.join(__dirname)));
+/* -------------------- DOWNLOAD SEGMENTS CONCURRENTLY -------------------- */
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🎬 StreamDL running at http://0.0.0.0:${PORT}\n`);
-});
+async function downloadSegments(url, outputDir) {
+    const res = await axios.get(url);
+    const playlist = res.data;
+
+    const segments = playlist
+        .split("\n")
+        .filter(l => l && !l.startsWith("#"));
+
+    if (!segments.length) throw new Error("No segments found.");
+
+    console.log(chalk.green(`✅ Found ${segments.length} segments`));
+
+    const segmentDir = path.join(outputDir, "segments");
+    fs.mkdirSync(segmentDir, { recursive: true });
+
+    let downloaded = 0;
+    let totalBytes = 0;
+    let startTime = Date.now();
+
+    const limit = pLimit(CONCURRENT_DOWNLOADS);
+
+    await Promise.all(
+        segments.map((seg, index) =>
+            limit(async () => {
+                const segmentUrl = new URL(seg, url).toString();
+                const segmentPath = path.join(segmentDir, `seg${index}.ts`);
+
+                const response = await axios({
+                    url: segmentUrl,
+                    method: "GET",
+                    responseType: "arraybuffer"
+                });
+
+                const buffer = Buffer.from(response.data);
+                fs.writeFileSync(segmentPath, buffer);
+
+                downloaded++;
+                totalBytes += buffer.length;
+
+                const elapsed = (Date.now() - startTime) / 1000;
+                const speed = (totalBytes / 1024 / 1024 / elapsed).toFixed(2);
+
+                process.stdout.write(
+                    `\r⬇ Downloading ${downloaded}/${segments.length} | ` +
+                    `${speed} MB/s`
+                );
+            })
+        )
+    );
+
+    console.log("\n✅ All segments downloaded.");
+    return segmentDir;
+}
+
+/* -------------------- MERGE TO MP4 -------------------- */
+
+function mergeSegments(segmentDir, outputFile) {
+    console.log(chalk.yellow("\n⚙ Merging → MP4..."));
+
+    const files = fs
+        .readdirSync(segmentDir)
+        .filter(f => f.endsWith(".ts"))
+        .sort()
+        .map(f => path.join(segmentDir, f));
+
+    return new Promise((resolve, reject) => {
+        const command = ffmpeg();
+
+        files.forEach(file => command.input(file));
+
+        command
+            .on("progress", progress => {
+                if (progress.percent) {
+                    process.stdout.write(
+                        `\r🔄 Converting: ${progress.percent.toFixed(2)}%`
+                    );
+                }
+            })
+            .on("end", () => {
+                console.log("\n✅ Conversion Complete!");
+                resolve();
+            })
+            .on("error", err => reject(err))
+            .mergeToFile(outputFile, segmentDir);
+    });
+}
+
+/* -------------------- CREATE DOWNLOAD LINK -------------------- */
+
+function showLink(filePath) {
+    const absolute = path.resolve(filePath);
+    console.log("\n🎉 DONE!");
+    console.log(chalk.green(`file://${absolute}`));
+    console.log("👉 Ctrl + Click to open.");
+}
+
+/* -------------------- MAIN -------------------- */
+
+async function main() {
+    console.clear();
+    console.log(chalk.magenta.bold("\n=== FAST M3U8 → MP4 CONVERTER ===\n"));
+
+    try {
+        const url = await askUrl();
+        const bestUrl = await getBestStream(url);
+
+        const outputDir = path.join(process.cwd(), "output");
+        fs.mkdirSync(outputDir, { recursive: true });
+
+        const segmentDir = await downloadSegments(bestUrl, outputDir);
+
+        const outputFile = path.join(outputDir, "video.mp4");
+
+        await mergeSegments(segmentDir, outputFile);
+
+        showLink(outputFile);
+    } catch (err) {
+        console.error(chalk.red("\n❌ Error:"), err.message);
+    }
+}
+
+main();
